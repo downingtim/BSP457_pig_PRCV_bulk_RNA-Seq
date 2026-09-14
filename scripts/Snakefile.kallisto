@@ -1,0 +1,145 @@
+import os
+import re
+from pathlib import Path
+
+configfile: "config.yaml"
+
+R1_PATTERNS = [
+    r'^(.*)(_1)(\.fq|\.fastq)(\.gz)?$',
+    r'^(.*)(_R1_001)(\.fq|\.fastq)(\.gz)?$',
+    r'^(.*)(_R1)(\.fq|\.fastq)(\.gz)?$',
+    r'^(.*)(\.1)(\.fq|\.fastq)(\.gz)?$',
+]
+
+R2_PATTERNS = [
+    r'^(.*)(_2)(\.fq|\.fastq)(\.gz)?$',
+    r'^(.*)(_R2_001)(\.fq|\.fastq)(\.gz)?$',
+    r'^(.*)(_R2)(\.fq|\.fastq)(\.gz)?$',
+    r'^(.*)(\.2)(\.fq|\.fastq)(\.gz)?$',
+]
+
+PE_REGEXES = [re.compile(p) for p in (*R1_PATTERNS, *R2_PATTERNS)]
+
+FASTQ_EXTENSIONS = (
+    ".fq",
+    ".fastq",
+    ".fq.gz",
+    ".fastq.gz",
+)
+
+
+def get_prefix(filename):
+    """Return sample prefix for PE or SE filename."""
+    for rx in PE_REGEXES:
+        m = rx.match(filename)
+        if m:
+            return m.group(1)
+
+    for ext in sorted(FASTQ_EXTENSIONS, key=len, reverse=True):
+        if filename.endswith(ext):
+            return filename[:-len(ext)]
+
+    return None
+
+
+def discover_samples(sampledir_path):
+    sampledir = Path(sampledir_path)
+    samples = {}
+
+    for root, _, files in os.walk(sampledir):
+        rel_dir = Path(root).relative_to(sampledir)
+
+        for filename in files:
+            prefix = get_prefix(filename)
+            if prefix is None:
+                continue
+
+            if rel_dir.name == prefix:
+                sample_id = str(rel_dir)
+            else:
+                sample_id = (
+                    prefix
+                    if rel_dir == Path(".")
+                    else str(rel_dir / prefix)
+                )
+
+            samples.setdefault(sample_id, []).append(
+                str(Path(root) / filename)
+            )
+
+    for files in samples.values():
+        files.sort()
+
+    return samples
+
+SAMPLEDIR = Path(config.get("kallisto", {}).get("sampledir", "trimmed"))
+SAMPLES_DICT = discover_samples(SAMPLEDIR)
+
+PE_SAMPLES = [s for s, files in SAMPLES_DICT.items() if len(files) == 2]
+SE_SAMPLES = [s for s, files in SAMPLES_DICT.items() if len(files) == 1]
+ALL_SAMPLES = list(SAMPLES_DICT.keys())
+
+print(f"Discovered {len(ALL_SAMPLES)} trimmed samples total.")
+print(f"  Paired-End: {len(PE_SAMPLES)}")
+print(f"  Single-End: {len(SE_SAMPLES)}")
+
+INDEX = config.get("kallisto", {}).get("index", "index/index.idx")
+OUTDIR = config.get("kallisto", {}).get("outdir", "kallisto")
+
+# Single-end parameters
+FRAGMENT_LEN = config.get("kallisto", {}).get("fragment_len", 200)
+SD = config.get("kallisto", {}).get("sd", 20)
+
+rule all:
+   input:
+        abundance=expand(OUTDIR + "/{ID}/abundance.tsv", ID=ALL_SAMPLES),
+        plot=expand(OUTDIR + "/{ID}/abundance.png", ID=ALL_SAMPLES),
+   shell: "echo Done"
+
+
+rule kallisto_pe:
+   input:
+        f1=lambda wildcards: SAMPLES_DICT[wildcards.ID][0],
+        f2=lambda wildcards: SAMPLES_DICT[wildcards.ID][1],
+   output:
+        abundance=OUTDIR + "/{ID}/abundance.tsv"
+   log:
+        stdout=OUTDIR + "/{ID}/log/stdout.txt",
+        stderr=OUTDIR + "/{ID}/log/stderr.txt",
+   threads: 12
+   wildcard_constraints:
+        ID="|".join(re.escape(s) for s in PE_SAMPLES) if PE_SAMPLES else "$^"
+   shell:
+      """
+      mkdir -p $(dirname {output.abundance})/log 
+      kallisto quant -i {INDEX} -o $(dirname {output.abundance}) -t {threads} -b 100 {input.f1} {input.f2} >{log.stdout} 2>{log.stderr}
+      """
+
+rule kallisto_se:
+   input:
+        f1=lambda wildcards: SAMPLES_DICT[wildcards.ID][0],
+   output:
+        abundance=OUTDIR + "/{ID}/abundance.tsv"
+   log:
+        stdout=OUTDIR + "/{ID}/log/stdout.txt",
+        stderr=OUTDIR + "/{ID}/log/stderr.txt",
+   threads: 12
+   wildcard_constraints:
+        ID="|".join(re.escape(s) for s in SE_SAMPLES) if SE_SAMPLES else "$^"
+   shell:
+      """
+      mkdir -p $(dirname {output.abundance})/log 
+      kallisto quant -i {INDEX} -o $(dirname {output.abundance}) -t {threads} -b 100 --single -l {FRAGMENT_LEN} -s {SD} {input.f1} >{log.stdout} 2>{log.stderr}
+      """
+
+rule plot:
+   input:
+        abundance=OUTDIR + "/{ID}/abundance.tsv"
+   output:
+        plot=OUTDIR + "/{ID}/abundance.png"
+   shell:
+      """
+      set +e
+      Rscript  ./abundanceplot.R {input.abundance} {output.plot} 
+      exit 0
+      """

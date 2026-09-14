@@ -1,0 +1,5 @@
+args <- commandArgs(trailingOnly = TRUE)
+set1 <- read.csv(args[1], sep="\t")
+png(args[2])
+hist(log(set1$tpm), breaks=443) + grid()
+dev.off()

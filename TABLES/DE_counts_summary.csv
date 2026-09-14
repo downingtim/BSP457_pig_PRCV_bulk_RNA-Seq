@@ -1,0 +1,10 @@
+"contrast","n_DE_transcripts"
+"Bronchial_6hpi_Inf_vs_Mock",2
+"Bronchial_24hpi_Inf_vs_Mock",44
+"Tracheal_6hpi_Inf_vs_Mock",0
+"Tracheal_24hpi_Inf_vs_Mock",3
+"Infection_overall",1
+"Site_Bronchial_vs_Tracheal",4417
+"Time_24_vs_6hpi",3603
+"Infection_x_Site",0
+"Infection_x_Time",1
