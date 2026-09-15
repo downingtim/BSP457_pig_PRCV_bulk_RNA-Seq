@@ -1,0 +1,2 @@
+"target_id","logFC","AveExpr","t","P.Value","adj.P.Val","B","target_id.1","ens_gene","ext_gene","gene_label","significant"
+"ENSSSCT00000005691.2",5.7760353053003,-4.01642114868758,6.8415525667408,4.699878608235e-08,0.00153234842142894,-3.68491951886298,"ENSSSCT00000005691.2","ENSSSCG00000005163","IFNB1","IFNB1","Significant"

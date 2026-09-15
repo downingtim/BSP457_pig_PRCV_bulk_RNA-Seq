@@ -1,3 +1,211 @@
+# BSP457 — Porcine Airway ALI Culture PRCV Challenge
+
+Sequencing and analysis pipeline for a porcine bronchial/tracheal air-liquid
+interface (ALI) culture challenge experiment: two parallel analyses on the
+same 48-library design — (1) challenge-virus genome sequencing and variant
+calling against the reference genome, and (2) host (pig) transcriptome
+differential expression.
+
+## Experimental design
+
+6 animals (4100, 4101, 4103, 4108, 4194, 4198), each contributing bronchial
+and tracheal ALI cultures, mock-treated or infected, sampled at 6 and 24
+hours post-infection (hpi). Full 2 (site) x 2 (time) x 2 (infection)
+factorial, 48 libraries total (one per animal per condition).
+
+## Repository structure
+
+```
+GITHUB/
+├── scripts/
+│   ├── kraken_illumina.sh              # kraken2 classification
+│   ├── kraken_illumina_extract.sh      # extract virus-classified reads
+│   ├── guide.sh                        # per-sample mapping + variant calling
+│   ├── filter.sh                       # variant filtering + caller concordance
+│   ├── coverage_viz.R                  # viral genome coverage figures
+│   ├── Snakefile.kallisto              # host transcript quantification (not reviewed here)
+│   ├── Snakemake.qc                    # read QC/trimming (not reviewed here)
+│   ├── 1.R                             # likely: host DE analysis (not confirmed)
+│   └── abundanceplot.R                 # likely: PCA/TPM figures (not confirmed)
+├── DATA/
+│   ├── DQ811787.fasta / .fasta.fai / .gb   # PRCV reference genome
+│   └── adapters.fa
+├── TABLES/                             # DE result tables, sleuth tables, TPMs
+└── FIGURES/                            # PCA, volcano, venn, coverage plots
+```
+
+Four scripts not reviewed for this README (`Snakefile.kallisto`,
+`Snakemake.qc`, `1.R`, `abundanceplot.R`) are listed for completeness only;
+their descriptions above are inferred from filenames and output files, not
+from reading their contents.
+
+## Reference genome
+
+`DATA/DQ811787.fasta` — Porcine respiratory coronavirus (PRCV), GenBank
+accession DQ811787. `.fai` is the samtools faidx index; `.gb` is the
+GenBank flat-file annotation. `DATA/adapters.fa` holds adapter sequences
+for read trimming.
+
+## Pipeline
+
+### 1. Read QC / trimming
+`scripts/Snakemake.qc` — not reviewed for this README.
+
+### 2. Taxonomic classification and viral read extraction
+
+`scripts/kraken_illumina.sh`
+- Runs kraken2 (`--db /home/share/`, 3 threads) on every sample in `FASTQS/`.
+- Output: `KRAKEN_FILES/<sample>` (classification), `KRAKEN_REPORT/<sample>` (report).
+
+`scripts/kraken_illumina_extract.sh`
+- Pulls reads classified to taxon 11146 (the challenge-virus lineage; run
+  with `--include-children --include-parents`) out of each sample's kraken2
+  output, via KrakenTools' `extract_kraken_reads.py`.
+- Output: `KRAKEN_VALID_FILES/<sample>.fastq`.
+- Note: a second taxon (`9822`, commented `# pig`) is assigned but never
+  used in an extraction call — looks unfinished, presumably intended for a
+  parallel host-read extraction.
+
+### 3. Viral genome mapping, variant calling and consensus
+
+`scripts/guide.sh <sample>` (one sample per invocation; the header comment
+shows this run in parallel over `KRAKEN_VALID_FILES/*.fastq`)
+
+- Maps reads to `DQ811787.fasta` with `minimap2 -ax sr`.
+- `samtools`: sort by queryname → `fixmate -m` → sort by coordinate →
+  `markdup -r -s` → `BAM_FINAL/<sample>.merged.bam` (deduplicated,
+  coordinate-sorted, indexed).
+- QC: `samtools flagstat`, `samtools coverage` (→ `COVERAGE/`), `samtools
+  depth` (→ `DEPTH/`).
+- Variant calling, two callers, both haploid (`--ploidy 1` / `-p 1`):
+  - freebayes (`-F 0.01 --min-alternate-count 1 --min-alternate-fraction
+    0.001`) → `FB_VCF_FILES/`
+  - `bcftools mpileup | bcftools call -cv --ploidy 1` → `BCF_VCF_FILES/`
+  - both normalised with `bcftools norm -m-both`
+- Consensus sequences from the BCFtools calls, two haplotype-selection
+  modes (`-H LA`, `-H LR`) → `CONSENSUS/`.
+
+### 4. Variant filtering and caller concordance
+
+`scripts/filter.sh`
+
+- FreeBayes calls: SNPs only, `QUAL>=20`, `INFO/DP>=5`, `INFO/AO>=5`,
+  `INFO/AF>0.05`.
+- BCFtools calls: same depth/quality/alt-read thresholds, computed manually
+  from the `DP`/`DP4` INFO tags (`awk`), biallelic SNPs only.
+- Both callers additionally restricted to position `500` to
+  `genome_length-500` (trims the first/last 500 bp of the reference).
+- Output: `FILTERED_VCF/<sample>.{freebayes,bcftools}.filtered.vcf.gz`
+  (bgzipped, tabix-indexed).
+- `SNP_TABLES/<sample>.merged_snps.tsv` — union of both callers' SNPs
+  (CHROM/POS/REF/ALT/caller); per-sample FreeBayes/BCFtools/union counts
+  are printed to stdout.
+
+### 5. Viral genome coverage visualisation
+
+`scripts/coverage_viz.R`
+
+- Reads every `COVERAGE/*.coverage.txt` (`samtools coverage` output,
+  %-covered column), parses tissue/timepoint/infection/animal from the
+  filename ("traheal" is matched as an alternate spelling of tracheal).
+- `FIGURES/coverage.png` — % genome covered per sample, by the 8
+  site x time x infection groups.
+- `FIGURES/coverage_6_vs_24hpi_paired.png` — per-animal 6 -> 24 hpi
+  trajectories (infected samples only, complete pairs only), faceted by
+  tissue.
+- `FIGURES/coverage_change_24_minus_6hpi.png` — within-animal change in
+  %coverage (24 hpi minus 6 hpi), by tissue.
+
+### 6. Host transcript quantification
+
+`scripts/Snakefile.kallisto` — not reviewed for this README. Output
+consistent with kallisto pseudo-alignment of each sample against the
+Ensembl *Sus scrofa* Sscrofa11.1 (release 115) transcriptome, one output
+directory per sample under `results/kallisto/<site>/<infection>/<time>hpi/
+<animal>/`.
+
+### 7. Sample sheet
+
+`SLEUTH/table.csv` — one row per library: `sample`, `site`, `time`,
+`infection`, `path` (to that library's kallisto output directory). 48 rows
+(6 animals x 2 sites x 2 timepoints x 2 infection states).
+
+### 8. Host differential expression
+
+Transcript-level (limma/voom, blocked on animal) and gene-level (sleuth
+likelihood-ratio tests) differential expression across the site x time x
+infection factorial design, plus STRING protein-protein interaction and
+KEGG gene set enrichment follow-up on the resulting gene lists. Script not
+confirmed (likely `scripts/1.R`).
+
+- Design: `~0 + group + animal` (group = site:time:infection, 8 levels;
+  animal blocks the 6 pigs, each contributing one sample per group — a
+  complete randomised block design).
+- limma contrasts: infected-vs-mock within each site x time cell (4);
+  infection, site and time main effects (3); infection x site and
+  infection x time interactions (2).
+- Significance: Benjamini-Hochberg FDR < 0.05 and |log2FC| > 1.39
+  (~2.6-fold).
+- sleuth LRTs: main effects of site/time/infection, plus the 2-way and
+  3-way interaction terms.
+- STRING PPI (v12, *Sus scrofa*, taxon 9823, score >= 700) and KEGG GSEA
+  (clusterProfiler `gseKEGG`) run per contrast on each contrast's DE gene
+  list.
+
+## Outputs
+
+### TABLES/
+
+- `limma.res_<contrast>.csv` — full transcript-level limma/voom results,
+  one file per contrast (9 contrasts).
+- `<contrast>.all.csv` / `<contrast>.DE.csv` — same results annotated with
+  gene IDs/symbols, and the FDR+logFC-significant subset.
+- `DE_counts_summary.csv` — DE transcript counts per contrast.
+- `all_DE_union_primary_contrasts.csv` — union of DE transcripts across the
+  4 site x time infected-vs-mock contrasts.
+- `all_DE_multiple_transcripts.csv` — genes with more than one DE
+  transcript in that union.
+- `sleuth_DE_<term>.csv` — gene-level LRT results (main effects and
+  interaction terms).
+- `tpm_values.csv` — transcript TPM matrix used for PCA.
+
+### FIGURES/
+
+- `PC1.PC2.*`, `PC3.PC4.*`, `plot_sample_heatmap.*` — sample-level QC.
+- `<contrast>.volcano.pdf` — one volcano plot per limma contrast.
+- `DE_venn_site_time.*` — overlap of DE genes across the 4 site x time
+  contrasts.
+- `DE_gene_expression_panels.*` — per-gene expression across all 8 groups
+  for the union of DE transcripts.
+- `pairs_logFC_primary_contrasts.pdf` — pairwise correlation of logFC
+  across the 4 site x time contrasts.
+- `plotSA.pdf` — voom/limma mean-variance trend diagnostic.
+- `coverage*.png` — viral genome coverage figures (see section 5).
+
+## Dependencies
+
+- kraken2, KrakenTools (`extract_kraken_reads.py`)
+- minimap2, samtools, freebayes, bcftools, htslib (bgzip/tabix)
+- kallisto, sleuth
+- R: tidyverse, limma, edgeR, STRINGdb, igraph, ggraph, clusterProfiler,
+  org.Ss.eg.db, rtracklayer
+- R and package versions not pinned in this README — record `sessionInfo()`
+  alongside results if reproducibility matters.
+
+## Known issues
+
+- `kraken_illumina_extract.sh` sets an unused `taxon=9822` variable (see
+  section 2).
+- STRING/KEGG GSEA outputs (from step 8) write to `STRING/` and `KEGG/`,
+  which aren't shown in the `TABLES/`/`FIGURES/` listing this README was
+  based on — confirm those steps have been run if those directories are
+  missing.
+- Scripts not reviewed for this README (`Snakefile.kallisto`,
+  `Snakemake.qc`, `1.R`, `abundanceplot.R`): descriptions above are
+  inferred from filenames and outputs, not from reading their contents —
+  check them directly before relying on this README for those steps.
+  
+
 # Methods
 
 ## Sample collection
