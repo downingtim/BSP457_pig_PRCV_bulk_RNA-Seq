@@ -157,6 +157,12 @@ cont <- makeContrasts(
   Tracheal_6hpi_Inf_vs_Mock   = grouptracheal_6_infected   - grouptracheal_6_mock,
   Tracheal_24hpi_Inf_vs_Mock  = grouptracheal_24_infected  - grouptracheal_24_mock,
 
+  Site_Bronchial_vs_Tracheal_mock = (groupbronchial_6_mock + groupbronchial_24_mock) / 2 -
+                                (grouptracheal_6_mock + grouptracheal_24_mock) / 2,
+
+  Time_24_vs_6hpi_mock = ( groupbronchial_24_mock + grouptracheal_24_mock) / 2 -
+                     ( groupbronchial_6_mock + grouptracheal_6_mock) / 2,
+
   Infection_overall = (groupbronchial_6_infected + groupbronchial_24_infected +
                         grouptracheal_6_infected + grouptracheal_24_infected) / 4 -
                        (groupbronchial_6_mock + groupbronchial_24_mock +
@@ -277,9 +283,9 @@ panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...) {
   if (missing(cex.cor)) cex.cor <- 1 + 0.4 / strwidth(txt)
   text(0.5, 0.5, txt, cex = 1 + cex.cor * Cor) }
 
-pdf("pairs_logFC_primary_contrasts.pdf", width = 6, height = 6)
-pairs(fit2$coefficients[, primary_contrasts], cex = 0.1,
-      upper.panel = panel.cor, lower.panel = panel.smooth, cex.labels = 1.2)
+pdf("pairs_logFC_primary_contrasts.pdf", width =9, height = 9)
+pairs(fit2$coefficients[, primary_contrasts], cex = 0.2,
+      upper.panel = panel.cor, lower.panel = panel.smooth, cex.labels =0.6)
 dev.off()
 
 ## 4g. overlap of DE genes across the 4 site x time comparisons ----------------
@@ -708,3 +714,170 @@ power_calc <- function(n_per_group, sigma, df, alpha = 0.05, delta = 1) {
   pt(tcrit, df, ncp, lower.tail = FALSE) + pt(-tcrit, df, ncp) }
 
 sapply(c(6, 12, 24), power_calc, sigma = sigma_typical, df = df_total)
+
+####### 8 - Leveraging the repeated-measures (paired-animal) design ###########
+# Every sample sheet row is one of 6 identifiable animals (4100, 4101, 4103,
+# 4108, 4194, 4198), each meant to contribute one library to every one of the
+# 8 site x time x infection groups. That repeated-measures structure is
+# already used once above (animal as a fixed blocking factor in `design`,
+# Part 4a) -- this section (a) checks that the pairing is actually complete
+# in the current table.csv, (b) quantifies how much blocking on animal is
+# buying you, (c) cross-checks the fixed-block result against limma's
+# purpose-built repeated-measures tool (duplicateCorrelation), and (d) plots
+# the paired mock -> infected trajectory per animal for the genes that came
+# out significant, so the model-based result has a visual, per-animal
+# sanity check. Paste this at the end of the existing script -- it reuses
+# `full`, `design`, `y`, `v`, `fit`, `cont`, `res_list`, `de_counts`,
+# `vol_list`, `primary_contrasts`, `string_gsea_contrasts`, `all_de`,
+# `gene_lookup` and `t2g` from earlier in the script.
+
+## 8a. is the pairing actually complete? ---------------------------------------
+# A complete design has exactly one sample per animal per group. Don't
+# assume it -- check it.
+
+pairing_check <- full %>%
+  count(animal, group, name = "n") %>%
+  tidyr::complete(animal, group, fill = list(n = 0)) %>%
+  tidyr::pivot_wider(names_from = group, values_from = n)
+
+print(pairing_check)
+write.csv(pairing_check, "animal_group_pairing_check.csv", row.names = FALSE)
+
+missing_cells <- full %>%
+  count(animal, group, name = "n") %>%
+  tidyr::complete(animal, group, fill = list(n = 0)) %>%
+  filter(n == 0)
+
+if (nrow(missing_cells) > 0) {
+  cat("\nWARNING: incomplete pairing -- missing animal x group cell(s):\n")
+  print(missing_cells)
+  cat("The animal-blocked design still fits (each affected animal still has",
+      "7/8 cells), but it is no longer a perfectly balanced block design --",
+      "the affected group runs on one fewer replicate, and that animal's",
+      "blocking coefficient is estimated from 7 groups instead of 8.\n\n")
+} else {
+  cat("\nPairing complete: every animal has exactly one sample in every group.\n\n")
+}
+
+## 8b. how much does blocking on animal actually buy you? ----------------------
+# Refit the same filtered/normalised counts without the animal term, on the
+# same contrasts, same thresholds, and compare.
+
+design_noblock <- model.matrix(~0 + group, data = full)
+colnames(design_noblock) <- make.names(colnames(design_noblock))
+
+v_noblock <- voom(y, design_noblock)
+fit_noblock <- lmFit(v_noblock, design_noblock)
+fit_noblock <- eBayes(fit_noblock, trend = TRUE)
+
+cont_noblock <- makeContrasts(
+  Bronchial_6hpi_Inf_vs_Mock  = groupbronchial_6_infected  - groupbronchial_6_mock,
+  Bronchial_24hpi_Inf_vs_Mock = groupbronchial_24_infected - groupbronchial_24_mock,
+  Tracheal_6hpi_Inf_vs_Mock   = grouptracheal_6_infected   - grouptracheal_6_mock,
+  Tracheal_24hpi_Inf_vs_Mock  = grouptracheal_24_infected  - grouptracheal_24_mock,
+  Infection_overall = (groupbronchial_6_infected + groupbronchial_24_infected +
+                        grouptracheal_6_infected + grouptracheal_24_infected) / 4 -
+                       (groupbronchial_6_mock + groupbronchial_24_mock +
+                        grouptracheal_6_mock + grouptracheal_24_mock) / 4,
+  levels = design_noblock
+)
+
+fit2_noblock <- contrasts.fit(fit_noblock, cont_noblock)
+fit2_noblock <- eBayes(fit2_noblock, trend = TRUE)
+
+de_counts_noblock <- sapply(colnames(cont_noblock), function(cn) {
+  r <- topTable(fit2_noblock, coef = cn, number = Inf)
+  sum(r$adj.P.Val <= 0.05 & abs(r$logFC) > 1, na.rm = TRUE)
+})
+
+blocking_comparison <- data.frame(
+  contrast = names(de_counts_noblock),
+  DE_blocked_on_animal = as.integer(de_counts[names(de_counts_noblock)]),
+  DE_unblocked = as.integer(de_counts_noblock)
+)
+
+cat("Median residual SD, blocked model:  ", round(median(sqrt(fit$s2.post)), 3), "\n")
+cat("Median residual SD, unblocked model:", round(median(sqrt(fit_noblock$s2.post)), 3), "\n\n")
+
+## 8c. duplicateCorrelation cross-check -----------------------------------------
+# limma's purpose-built tool for repeated measurements on the same subject:
+# rather than a fixed coefficient per animal (the `animal` term in `design`),
+# this estimates one average within-animal correlation across all genes and
+# folds it into the model as a random effect. On a complete, balanced block
+# it usually agrees closely with the fixed-effect approach; it also tends to
+# degrade more gracefully than a fixed block when the pairing isn't perfectly
+# complete (see 8a). Two-pass procedure, as recommended in the limma user guide.
+
+v1 <- voom(y, design_noblock)
+corfit1 <- duplicateCorrelation(v1, design_noblock, block = full$animal)
+v_dupcor <- voom(y, design_noblock, block = full$animal, correlation = corfit1$consensus.correlation)
+corfit2 <- duplicateCorrelation(v_dupcor, design_noblock, block = full$animal)
+cat("Estimated within-animal consensus correlation:", round(corfit2$consensus.correlation, 3), "\n\n")
+
+fit_dupcor <- lmFit(v_dupcor, design_noblock, block = full$animal, correlation = corfit2$consensus.correlation)
+fit2_dupcor <- contrasts.fit(fit_dupcor, cont_noblock)
+fit2_dupcor <- eBayes(fit2_dupcor, trend = TRUE)
+
+de_counts_dupcor <- sapply(colnames(cont_noblock), function(cn) {
+  r <- topTable(fit2_dupcor, coef = cn, number = Inf)
+  sum(r$adj.P.Val <= 0.05 & abs(r$logFC) > 1, na.rm = TRUE)
+})
+
+blocking_comparison$DE_duplicateCorrelation <- as.integer(de_counts_dupcor[blocking_comparison$contrast])
+print(blocking_comparison)
+write.csv(blocking_comparison, "animal_blocking_comparison.csv", row.names = FALSE)
+
+## 8d. paired per-animal view of the primary infection effect ------------------
+# For each site x time cell, connect each animal's own mock -> infected
+# points with a line -- same visual language as coverage_viz.R's paired
+# 6-vs-24hpi plot, applied here to host expression instead of viral genome
+# coverage. Makes it visible whether a "significant" contrast reflects a
+# consistent shift across (up to) all 6 animals, or is driven by a subset.
+
+de_genes_for_pairing <- unique(all_de$target_id)
+
+if (length(de_genes_for_pairing) == 0) {
+
+  message("No DE transcripts across the primary contrasts -- skipping the paired-animal plot.")
+
+} else {
+
+  if (length(de_genes_for_pairing) > 30) {
+    # keep the plot readable -- top 30 by significance across the primary contrasts
+    de_genes_for_pairing <- all_de %>%
+      arrange(adj.P.Val) %>%
+      distinct(target_id, .keep_all = TRUE) %>%
+      slice_head(n = 30) %>%
+      pull(target_id)
+  }
+
+  paired_expr <- as.data.frame(v$E)
+  paired_expr$target_id <- rownames(paired_expr)
+  paired_expr <- paired_expr %>%
+    filter(target_id %in% de_genes_for_pairing) %>%
+    pivot_longer(cols = -target_id, names_to = "sample", values_to = "expression") %>%
+    left_join(full[, c("sample", "site", "time", "infection", "animal")], by = "sample") %>%
+    left_join(gene_lookup %>% dplyr::select(target_id, symbol), by = "target_id") %>%
+    mutate(
+      plot_name = ifelse(is.na(symbol) | symbol == "", target_id, paste0(symbol, " | ", target_id)),
+      site_time = paste0(site, ", ", time, " hpi"),
+      infection = factor(infection, levels = c("mock", "infected"))
+    )
+
+  p_paired <- ggplot(paired_expr, aes(x = infection, y = expression, group = animal)) +
+    geom_line(aes(colour = animal), alpha = 0.6, linewidth = 0.6) +
+    geom_point(aes(colour = animal), size = 2) +
+    facet_grid(plot_name ~ site_time, scales = "free_y") +
+    labs(x = NULL, y = "Normalised expression (voom logCPM)", colour = "Animal") +
+    theme_bw() +
+    theme(strip.text.y = element_text(size = 6, angle = 0),
+          strip.text.x = element_text(size = 9, face = "bold"),
+          legend.position = "bottom")
+
+  n_genes_paired <- length(unique(paired_expr$plot_name))
+  ggsave("DE_gene_paired_by_animal.pdf", p_paired,
+         width = 10, height = max(6, n_genes_paired * 1.1), limitsize = FALSE)
+  ggsave("DE_gene_paired_by_animal.png", p_paired,
+         width = 10, height = max(6, n_genes_paired * 1.1), dpi = 300,
+         bg = "white", limitsize = FALSE)
+}
